@@ -1,0 +1,1180 @@
+// I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
+// for both classes must be in the include path of your project
+#include "I2Cdev.h"
+
+#include "Wire.h"
+//#include "MPU6050_6Axis_MotionApps20.h"
+#include <HMC5883L.h>
+#include <Adafruit_SSD1306.h>
+
+#include "RTIMUSettings.h"
+#include "RTIMU.h"
+#include "RTFusionRTQF.h"
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdateServer.h>
+
+extern "C" {
+#include <user_interface.h>
+}
+
+// instantiation
+// MPU6050 mpu;
+//Adafruit_SSD1306 displaySmall = Adafruit_SSD1306(128, 32, &Wire);
+Adafruit_SSD1306 displayBig = Adafruit_SSD1306(128, 64, &Wire);
+
+HMC5883L compass;
+
+RTIMU *imu;              // the IMU object
+RTFusionRTQF fusion;     // the fusion object
+RTIMUSettings settings;  // the settings object
+
+MDNSResponder mdns;
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
+
+///////////
+////VERSION
+///////////
+
+String version = "Version:\n1.00";
+
+
+///////////
+////INSTALLATION ROLL CORRECTION
+///////////
+int rollCorrection = 0;
+
+//////////////
+/// COMPASS VARS
+/////////////////////////
+
+// compass calibration data
+int minX = 0;
+int maxX = 0;
+int minY = 0;
+int maxY = 0;
+int offX = 0;
+int offY = 0;
+
+const char compass_queue_new[][10] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"};
+
+unsigned long last_compass_time;
+int compass_update_interval = 100;
+int compass_calibration_time = 30000;
+
+bool compassReady = false;
+bool compassCalibration = false;
+bool compassCalibrationDone = false;
+
+//// ::END OF COMPASS VARS
+
+#define LED_PIN LED_BUILTIN  //13
+#define INTERRUPT_PIN D4     //D8  // use pin 2 on Arduino Uno & most boards
+bool blinkState = false;
+
+// MPU control/status vars
+bool dmpReady = false;   // set true if DMP init was successful
+uint8_t mpuIntStatus;    // holds actual interrupt status byte from MPU
+uint8_t devStatus;       // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;     // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;      // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64];  // FIFO storage buffer
+
+// orientation/motion vars
+//Quaternion q;         // [w, x, y, z]         quaternion container
+//VectorInt16 aa;       // [x, y, z]            accel sensor measurements
+//VectorInt16 aaReal;   // [x, y, z]            gravity-free accel sensor measurements
+//VectorInt16 aaWorld;  // [x, y, z]            world-frame accel sensor measurements
+//VectorFloat gravity;  // [x, y, z]            gravity vector
+float euler[3];       // [psi, theta, phi]    Euler angle container
+float ypr[3];         // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+//
+int init_error_code = -1;
+
+unsigned long last_disp_time;
+int disp_update_interval = 500;
+
+
+// Use the following global variables and access functions to help store the overall
+// rotation angle of the sensor
+int acc_counter = 0;
+float acc_yaw_rad = 0;
+float acc_pitch_rad = 0;
+float acc_roll_rad = 0;
+
+float curr_yaw_rad = 0;
+float curr_pitch_rad = 0;
+float curr_roll_rad = 0;
+
+float curr_yaw_angle = 0;
+float curr_pitch_angle = 0;
+float curr_roll_angle = 0;
+float curr_roll_angle_smooth = 0;
+
+// data in radians
+void set_last_read_angle_data(float x, float y, float z) {
+  acc_yaw_rad += x;
+  acc_pitch_rad += y;
+  acc_roll_rad += z;
+
+  acc_counter += 1;
+}
+
+void calc_angle_data() {
+  curr_yaw_rad = acc_yaw_rad / acc_counter;
+  curr_pitch_rad = acc_pitch_rad / acc_counter;
+  curr_roll_rad = acc_roll_rad / acc_counter;
+
+  curr_yaw_angle = curr_yaw_rad * 180 / M_PI;
+  curr_pitch_angle = curr_pitch_rad * 180 / M_PI;
+  curr_roll_angle = curr_roll_rad * 180 / M_PI;
+
+  acc_yaw_rad = curr_yaw_rad;
+  acc_pitch_rad = curr_pitch_rad;
+  acc_roll_rad = curr_roll_rad;
+
+  curr_roll_angle_smooth = 0.92 * curr_roll_angle_smooth + 0.08 * (curr_roll_angle + rollCorrection);
+
+  acc_counter = 1;
+  // Serial.print("curr_yaw_rad=");Serial.print(curr_yaw_rad);
+  // Serial.print(" curr_pitch_rad=");Serial.print(curr_pitch_rad);
+  // Serial.print(" curr_roll_rad=");Serial.println(curr_roll_rad);
+  // Serial.print("curr_yaw_angle=");Serial.print(curr_yaw_angle);
+  // Serial.print(" curr_pitch_angle=");Serial.print(curr_pitch_angle);
+  // Serial.print(" curr_roll_angle=");Serial.println(curr_roll_angle);
+}
+
+float accel_x = 0;
+float accel_y = 0;
+float accel_z = 0;
+
+float curr_accel_x = 0;
+float curr_accel_y = 0;
+float curr_accel_z = 0;
+
+int accel_counter = 0;
+
+float curr_accel_x_smooth = 0;
+float curr_accel_y_smooth = 0;
+
+void set_last_accel_data(float x, float y, float z) {
+  accel_x += x;
+  accel_y += y;
+  accel_z += z;
+
+  accel_counter += 1;
+}
+
+void calc_accel_data() {
+  curr_accel_x = accel_x / acc_counter;
+  curr_accel_y = accel_y / acc_counter;
+  curr_accel_z = accel_z / acc_counter;
+
+  if(curr_accel_x > 100) {
+    curr_accel_x /= 100;
+  }
+
+  if(curr_accel_y > 100) {
+    curr_accel_y /= 100;
+  }
+
+  if(curr_accel_z > 100) {
+    curr_accel_z /= 100;
+  }
+
+  curr_accel_x_smooth = 0.5 * curr_accel_x_smooth + 0.5 * (curr_accel_x);
+  curr_accel_y_smooth = 0.5 * curr_accel_y_smooth + 0.5 * (curr_accel_y);
+
+  accel_counter = 1;
+}
+
+//////////////
+/// ELEVATION CHART VARS
+/////////////////////////
+
+const int chartWidth = 45;
+const int chartTotalTime = 30;  // minutes
+const int oneChartBarTimeInterval = (chartTotalTime * 60 / chartWidth) * 1000;
+float chartBars[chartWidth];
+int chartBarsPointer = 0;
+float maxChartValue = 0;
+int maxChartValueIndex = 0;
+float minChartValue = 0;
+int minChartValueIndex = 0;
+boolean chartBarCycle = false;
+float curr_roll_angle_smooth_accum = 0.00;
+int curr_roll_angle_smooth_counter = 0;
+unsigned long last_chart_calc_time;
+
+unsigned long lastRate;
+int sampleCount;
+
+///END:: ELEVATION CHART VARS
+
+void calc_elevation_chart_data() {
+  curr_roll_angle_smooth_accum += curr_roll_angle_smooth;
+  curr_roll_angle_smooth_counter++;
+
+  if (millis() - last_chart_calc_time >= oneChartBarTimeInterval) {
+    last_chart_calc_time = millis();
+
+    float value = (curr_roll_angle_smooth_accum / curr_roll_angle_smooth_counter); //(M_PI / 180) * 
+    bool update = false;
+
+    //Serial.print(" value=");Serial.println(value);
+
+    chartBars[chartBarsPointer] = value;
+
+    if(chartBarCycle) {
+      if(chartBarsPointer == maxChartValueIndex || chartBarsPointer == minChartValueIndex) {
+        maxChartValue = chartBars[0];
+        minChartValue = chartBars[0];
+
+        for (int i = 0; i < chartWidth; i++) {
+          if(chartBars[i] > maxChartValue) {
+            maxChartValue = chartBars[i];
+            maxChartValueIndex = chartBarsPointer;
+          }
+
+          if(chartBars[i] < minChartValue) {
+            minChartValue = chartBars[i];
+            minChartValueIndex = chartBarsPointer;
+          }
+        }
+
+        update = true;
+      }
+    }
+    
+    if(value > maxChartValue) {
+      maxChartValue = value;
+      maxChartValueIndex = chartBarsPointer;
+
+      update = true;
+    }
+
+    if(value < minChartValue) {
+      minChartValue = value;
+      minChartValueIndex = chartBarsPointer;
+      
+      update = true;
+    }
+
+    if(update) {
+      Serial.print(" minChartValue=");Serial.print(minChartValue);
+      Serial.print(" maxChartValue=");Serial.println(maxChartValue);
+    }
+
+    //Serial.print(" chartBarsPointer=");Serial.println(chartBarsPointer);
+    //Serial.print(" bar=");Serial.println(chartBars[chartBarsPointer]);
+    
+
+    if (chartBarsPointer >= chartWidth - 1) {
+      chartBarCycle = true;
+      chartBarsPointer = 0;
+    } else {
+      chartBarsPointer++;
+    }
+
+    //Serial.print(" chartBarsPointerNext=");Serial.println(chartBarsPointer);
+
+    curr_roll_angle_smooth_accum = 0;
+    curr_roll_angle_smooth_counter = 0;
+  }
+}
+
+// Compass average
+int acc_compas_counter = 0;
+float acc_head = 0;
+float acc_head_prev = 0;
+int curr_head = 0;
+
+void set_last_read_compas_data(float h) {
+  // if(abs(h - acc_head_prev) > 90) {
+  //   acc_head = h;
+  //   acc_compas_counter = 1;
+  // } else {
+  //   acc_head += h;
+  //   acc_compas_counter += 1;
+  // }
+
+  // acc_head_prev = h;
+
+
+  acc_head = h;
+  acc_compas_counter = 1;
+}
+
+void calc_compass_average_data() {
+  curr_head = int((acc_head / acc_compas_counter) + 0.5);
+
+  acc_head = curr_head;
+
+  acc_compas_counter = 1;
+}
+
+void wificonfig_wifiOn() {
+  wifi_fpm_do_wakeup();
+  wifi_fpm_close();
+  delay(100);
+}
+
+#define FPM_SLEEP_MAX_TIME 0xFFFFFFF
+bool otaServer = true;
+int otaServerExpireTime = 1000 * 60 * 5; //5 mins
+
+
+void wificonfig_wifiOff() {
+  wifi_station_disconnect();
+  wifi_set_opmode(NULL_MODE);
+  wifi_set_sleep_type(MODEM_SLEEP_T);
+  wifi_fpm_open();
+  wifi_fpm_do_sleep(FPM_SLEEP_MAX_TIME);
+  delay(100);
+}
+
+// ================================================================
+// ===               INTERRUPT DETECTION ROUTINE                ===
+// ================================================================
+volatile bool mpuInterrupt = false;  // indicates whether MPU interrupt pin has gone high
+ICACHE_RAM_ATTR void dmpDataReady() {
+  mpuInterrupt = true;
+}
+
+// ================================================================
+// ===               SETUP ROUTINE                              ===
+// ================================================================
+void setup() {
+  int errcode;
+
+  // join I2C bus (I2Cdev library doesn't do this automatically)
+  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+    Wire.begin();
+    Wire.setClock(400000);  // 400kHz I2C clock. Comment this line if having compilation difficulties
+  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+    Fastwire::setup(400, true);
+  #endif
+
+  wificonfig_wifiOff();
+
+  // initialize serial communication
+  Serial.begin(38400);
+  delay(100);
+
+  // init big display
+  if (displayBig.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    displayBig.display();
+  } else {
+    Serial.println(F("SSD1306 allocation failed - big"));
+    init_error_code = 2;
+  }
+
+  // initialize device
+  Serial.println(F("Initializing I2C devices..."));
+  //mpu.initialize();
+  imu = RTIMU::createIMU(&settings);  // create the imu object
+  Serial.print("ArduinoIMU starting using device ");
+  Serial.println(imu->IMUName());
+  if ((errcode = imu->IMUInit()) < 0) {
+    Serial.print("Failed to init IMU: ");
+    Serial.println(errcode);
+  }
+
+  if (imu->getCalibrationValid())
+    Serial.println("Using compass calibration");
+  else
+    Serial.println("No valid compass calibration data");
+
+  lastRate = millis();
+  sampleCount = 0;
+
+  fusion.setSlerpPower(0.05);
+
+  // use of sensors in the fusion algorithm can be controlled here
+  // change any of these to false to disable that sensor
+
+  fusion.setGyroEnable(true);
+  fusion.setAccelEnable(true);
+  //fusion.setCompassEnable(true);
+
+  //pinMode(INTERRUPT_PIN, INPUT);
+
+  // verify connection
+  Serial.println(F("Testing device connections..."));
+  //Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+
+  // init displays
+  configDisplays();
+
+  showStartDisplayMessage("Init...");
+  delay(200);
+
+  showStartDisplayMessage(version);
+  delay(2000);
+
+  // 0x0D - compass addr
+  // 0x68 - gyro addr
+  // 0x3C - small disp
+  // 0x3D - big disp
+
+  // load and configure the DMP
+  showStartDisplayMessage("Init gyroscope...");
+
+  Serial.println(F("Initializing DMP..."));
+  //devStatus = mpu.dmpInitialize();
+
+  delay(100);
+
+  // make sure it worked (returns 0 if so)
+  if (devStatus == 0) {
+    showStartDisplayMessage("Calibrate gyroscope...");
+
+    // Calibration Time: generate offsets and calibrate our MPU6050
+    //mpu.CalibrateAccel(10);
+    // mpu.CalibrateGyro(10);
+
+   //mpu.setXAccelOffset(1799);
+   //mpu.setYAccelOffset(2);
+   //mpu.setZAccelOffset(1585);
+   //mpu.setXGyroOffset(169);
+   //mpu.setYGyroOffset(15);
+   //mpu.setZGyroOffset(6);
+
+    //mpu.PrintActiveOffsets();
+    // turn on the DMP, now that it's ready
+    Serial.println(F("Enabling DMP..."));
+    //mpu.setDMPEnabled(true);
+
+    // enable Arduino interrupt detection
+    Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+    Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+    Serial.println(F(")..."));
+    //attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    //mpuIntStatus = mpu.getIntStatus();
+
+    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // get expected DMP packet size for later comparison
+    //packetSize = mpu.dmpGetFIFOPacketSize();
+  } else {
+    // ERROR!
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+    // (if it's going to break, usually the code will be 1)
+    Serial.print(F("DMP Initialization failed (code "));
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+
+    showStartDisplayMessage("Init error occured. Please restart device.");
+  }
+
+  delay(500);
+
+  showStartDisplayMessage("Init compass...");
+
+  // Initialize HMC5883L
+  while (!compass.begin()) {
+    delay(500);
+  }
+
+  // Set measurement range
+  compass.setRange(HMC5883L_RANGE_1_3GA);
+
+  // Set measurement mode
+  compass.setMeasurementMode(HMC5883L_CONTINOUS);
+
+  // Set data rate
+  compass.setDataRate(HMC5883L_DATARATE_30HZ);
+
+  // Set number of samples averaged
+  compass.setSamples(HMC5883L_SAMPLES_8);
+
+  // Set calibration offset. See HMC5883L_calibration.ino
+  if (!compassCalibration) {
+    compass.setOffset(140, -42);
+  }
+
+  compassReady = true;
+
+  // configure LED for output
+  //pinMode(LED_PIN, OUTPUT);
+
+  delay(200);
+
+  //////// create wifi AP for OTA
+  if(otaServer) {
+    showStartDisplayMessage("Setup AP for OTA updates...");
+
+    wificonfig_wifiOn();
+    boolean result = WiFi.softAP("ESP_Tilt_AP", "12345678");
+
+    delay(100);
+    showStartDisplayMessage(result == true ? "AP setup OK" : "AP setup failed");
+    Serial.println(result == true ? "AP setup OK" : "AP setup failed");
+
+    delay(200);
+    IPAddress myIP = WiFi.softAPIP();  
+    Serial.print("Access Point IP address: ");Serial.println(myIP);
+    if (mdns.begin("espotaserver", myIP)) {
+      Serial.println("MDNS responder started");
+    }
+    httpUpdater.setup(&httpServer);
+    httpServer.begin();
+    
+    delay(100);
+    
+    showStartDisplayMessage("HTTPUpdateServer ready! Open " + myIP.toString() + "/update in your browser");
+    Serial.println("HTTPUpdateServer ready! Open http://espotaserver.local/update");
+    Serial.printf("or http://");Serial.print(myIP);Serial.println("/update in your browser");
+
+    delay(500);
+  }
+  
+  delay(500);
+
+  last_disp_time = millis();
+}
+
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+
+void loop() {
+  unsigned long now = millis();
+  unsigned long delta;
+  int loopCount = 1;
+
+  while (imu->IMURead()) {  // get the latest data if ready yet
+    // this flushes remaining data in case we are falling behind
+    if (++loopCount >= 10)
+      continue;
+    fusion.newIMUData(imu->getGyro(), imu->getAccel(), imu->getCompass(), imu->getTimestamp());
+    sampleCount++;
+    if ((delta = now - lastRate) >= 5000) {
+      Serial.print("Sample rate: ");
+      Serial.print(sampleCount);
+      if (imu->IMUGyroBiasValid())
+        Serial.println(", gyro bias valid");
+      else
+        Serial.println(", calculating gyro bias");
+
+      sampleCount = 0;
+      lastRate = now;
+    }
+
+    RTVector3 pose = fusion.getFusionPose();
+    set_last_read_angle_data(pose.x(), pose.y(), pose.z());
+  }
+
+  // read a packet from FIFO
+  // if (dmpReady && mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {  // Get the Latest packet
+  //   mpu.dmpGetQuaternion(&q, fifoBuffer);
+  //   mpu.dmpGetGravity(&gravity, &q);
+  //   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+  //   //mpu.dmpGetAccel(&aa, fifoBuffer);
+  //   //mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+  //   //mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
+    
+  //   set_last_read_angle_data(ypr[0], ypr[1], ypr[2]);
+  //   //set_last_accel_data(aaWorld.x, aaWorld.y, aaWorld.z);
+  // }
+
+  ///////////////////
+  // COMPASS
+  ///////////////////
+  if (compassCalibration) {
+    if(!compassCalibrationDone) {
+      doCompassCalibration();
+    }
+  } else {
+    processCompass();
+  }
+
+  if(otaServer) {
+    httpServer.handleClient();
+    if(millis() > otaServerExpireTime) {
+      otaServer = false;
+      wificonfig_wifiOff();
+      Serial.println("Wifi off");
+    }
+  }
+
+  if (millis() - last_disp_time >= disp_update_interval) {
+    last_disp_time = millis();
+
+    calc_angle_data();
+    calc_compass_average_data();
+    //calc_accel_data();
+
+    calc_elevation_chart_data();
+
+    // blink LED to indicate activity
+    blinkState = !blinkState;
+    //digitalWrite(LED_PIN, blinkState);
+
+    updateDisplayData();
+  }
+}
+
+void doCompassCalibration() {
+  Vector mag = compass.readRaw();
+
+  // Determine Min / Max values
+  minX = min(minX, int(mag.XAxis));
+  maxX = max(maxX, int(mag.XAxis));
+  minY = min(minY, int(mag.YAxis));
+  maxY = max(maxY, int(mag.YAxis));
+
+  if(millis() > compass_calibration_time) {
+    // Calculate offsets
+    offX = (maxX + minX) / 2;
+    offY = (maxY + minY) / 2;
+
+    compassCalibrationDone = true;
+
+    Serial.println("==============================================");
+    Serial.print(minX);
+    Serial.print(":");
+    Serial.print(maxX);
+    Serial.print(":");
+    Serial.print(minY);
+    Serial.print(":");
+    Serial.print(maxY);
+    Serial.print(":");
+    Serial.print(offX);
+    Serial.print(":");
+    Serial.println(offY);
+    Serial.println("==============================================");
+  }
+}
+
+void processCompass() {
+  if (compassReady && millis() - last_compass_time >= compass_update_interval) {
+    last_compass_time = millis();
+
+    Vector norm = compass.readNormalize();
+
+    // Calculate heading
+    float heading = atan2(norm.YAxis, norm.XAxis);
+
+    // Once you have your heading, you must then add your 'Declination Angle', which is the 'Error' of the magnetic field in your location.
+    // Find yours here: http://www.magnetic-declination.com/
+    float declinationAngle = (8 + 22 / 60) * M_PI / 180;  //0.148; //radians
+    heading += declinationAngle;
+
+    // Correct for when signs are reversed.
+    if (heading < 0)
+      heading += 2 * M_PI;
+
+    // Check for wrap due to addition of declination.
+    if (heading >= 2 * M_PI)
+      heading -= 2 * M_PI;
+
+    // Convert radians to degrees for readability.
+    float headingDegrees = heading * 180 / M_PI;
+    headingDegrees += 90;
+
+    if(headingDegrees >= 360) {
+      headingDegrees -= 360;
+    }
+
+    // Fix HMC5883L issue with angles
+    float fixedHeadingDegrees;
+
+    if (headingDegrees >= 1 && headingDegrees < 240) {
+      fixedHeadingDegrees = map(headingDegrees, 0, 239, 0, 179);
+    } else if (headingDegrees >= 240) {
+      fixedHeadingDegrees = map(headingDegrees, 240, 360, 180, 360);
+    }
+
+    set_last_read_compas_data(headingDegrees);
+  }
+}
+
+void updateDisplayData() {
+  displayBig.clearDisplay();
+
+  updateBigDisplayCompassData();
+  updateBigDisplayElevationChart();
+  updateBigDisplayGyroData();
+  updateBigDisplayMinMaxData();
+
+  displayBig.display();
+
+  // updateSmallDisplayData();
+}
+
+void updateSmallDisplayData() {
+  //   displaySmall.clearDisplay();
+  //   displaySmall.setCursor(0, 0);
+
+  //   displaySmall.fillTriangle(61,0,67,0,64,3,WHITE);
+  //   displaySmall.fillTriangle(61,31,67,31,64,28,WHITE);
+
+  //   int nearestSideIndex = int(round(curr_head/90));//%4;
+  //   int nearestSideAngle = nearestSideIndex * 90;
+  //   int head_diff = nearestSideAngle - curr_head;
+  //   float anglePixels = float(128)/float(compassFOV); // 128 - width of the screen
+  //   float x_diff = head_diff * anglePixels;
+
+  //   displaySmall.setTextColor(WHITE);
+
+  //   // Serial.print("nearestSideIndex="); Serial.print(nearestSideIndex);
+  //   // Serial.print(" nearestSideAngle="); Serial.print(nearestSideAngle);
+  //   // Serial.print(" head_diff="); Serial.print(head_diff);
+  //   // Serial.print(" x_diff="); Serial.print(x_diff);
+  //   // Serial.print(" anglePixels="); Serial.println(anglePixels);
+
+  //   int midXPoint = int(64 + x_diff);
+  //   int leftXPoint = int(midXPoint - 90*anglePixels);
+  //   int rightXPoint = int(midXPoint + 90*anglePixels);
+
+  //   int16_t x1, y1;
+  //   uint16_t w, h;
+
+  //   displaySmall.setTextSize(compassSideSize);
+
+  //   displaySmall.getTextBounds(String(compass_queue[nearestSideIndex + 2]), midXPoint, compassSideYPosition, &x1, &y1, &w, &h);
+  //   displaySmall.drawChar(midXPoint - w/2, compassSideYPosition, compass_queue[nearestSideIndex + 2], WHITE, BLACK, compassSideSize);
+
+  //   displaySmall.getTextBounds(String(compass_queue[nearestSideIndex + 3]), rightXPoint, compassSideYPosition, &x1, &y1, &w, &h);
+  //   displaySmall.drawChar(rightXPoint - w/2, compassSideYPosition, compass_queue[nearestSideIndex + 3], WHITE, BLACK, compassSideSize);
+
+  //   displaySmall.getTextBounds(String(compass_queue[nearestSideIndex + 1]), leftXPoint, compassSideYPosition, &x1, &y1, &w, &h);
+  //   displaySmall.drawChar(leftXPoint - w/2, compassSideYPosition, compass_queue[nearestSideIndex + 1], WHITE, BLACK, compassSideSize);
+
+  //   float sectorWidth = (rightXPoint - midXPoint)/(compassQuaterSectors + 1);
+
+  //   int centerNotch = floor(compassQuaterSectors/2) + 1;
+
+  //   for (int i = 1; i <= compassQuaterSectors; i++) {
+  //     displaySmall.drawFastVLine(midXPoint + sectorWidth*i, i == centerNotch ? 13 : 15, i == centerNotch ? 5 : 3, WHITE);
+  //     displaySmall.drawFastVLine(midXPoint - sectorWidth*i, i == centerNotch ? 13 : 15, i == centerNotch ? 5 : 3, WHITE);
+
+  //     // draw frontier notches
+  //     if (leftXPoint - sectorWidth*i >= 0) {
+  //       displaySmall.drawFastVLine(leftXPoint - sectorWidth*i, i == centerNotch ? 13 : 15, i == centerNotch ? 5 : 3, WHITE);
+  //     }
+  //     if(rightXPoint + sectorWidth*i <= 127) {
+  //       displaySmall.drawFastVLine(rightXPoint + sectorWidth*i, i == centerNotch ? 13 : 15, i == centerNotch ? 5 : 3, WHITE);
+  //     }
+  //   }
+
+  //   displaySmall.display();
+
+  Serial.print("Heading (degrees): ");
+  Serial.println(curr_head);
+}
+
+void updateBigDisplayCompassData() {
+  if(compassCalibration) {
+    displayBig.setCursor(0, 1);
+    displayBig.setTextSize(1);
+
+    if(compassCalibrationDone) {
+      displayBig.print(offX);
+      displayBig.print(" :: ");
+      displayBig.print(offY);
+    } else {
+      displayBig.print("Calibration:");
+      displayBig.print(int((compass_calibration_time - millis())/1000));
+    }
+  } else {
+    int shiftedHead = curr_head;
+
+    // if(shiftedHead >= 360) {
+    //   shiftedHead -= 360;
+    // } else if(shiftedHead < 0) {
+    //   shiftedHead += 360;
+    // }
+
+    int nearestSideIndex = int((float(shiftedHead) / 45.0) + 0.5);
+    int normalizedIndex = nearestSideIndex % 8;
+    
+
+    displayBig.setCursor(0, 1);
+    displayBig.setTextSize(2);
+
+    // int sideIndex = map(shiftedHead, 0, 359, 0, 8);
+
+    displayBig.print(compass_queue_new[nearestSideIndex]);
+
+    int16_t x1, y1;
+    uint16_t w, h;
+    displayBig.setTextSize(2);
+    displayBig.getTextBounds(String(curr_head), 0, 0, &x1, &y1, &w, &h);
+
+    displayBig.setCursor(63 - w, 1);
+    displayBig.print(curr_head);
+  }
+}
+
+void updateBigDisplayData() {
+  //Serial.print("P(R)="); Serial.print(curr_pitch_rad); Serial.print(" R(R)="); Serial.print(curr_roll_rad);
+  //Serial.print(" P(A)="); Serial.print(curr_pitch_angle); Serial.print(" R(A)="); Serial.println(curr_roll_angle);
+
+  displayBig.clearDisplay();
+
+  float cos_pitch_result = cos(curr_pitch_rad);
+  float sin_pitch_result = sin(curr_pitch_rad);
+
+  float tan_roll_result = atan(curr_roll_rad);
+
+  // Serial.print("cos(");
+  // Serial.print(curr_pitch_angle);
+  // Serial.print("°) = ");
+  // Serial.print(" (");
+  // Serial.print(curr_pitch_rad);
+  // Serial.print(") ");
+  // Serial.print(cos_pitch_result);
+  // Serial.print(" sin(");
+  // Serial.print(curr_pitch_angle);
+  // Serial.print("°) = ");
+  // Serial.println(sin_pitch_result);
+
+  int pitch_radius = 25;
+  int pitch_start_x = 95;  //displayBig.width()*0.75;
+  int pitch_start_y = displayBig.height() / 2 + 5;
+
+  int diff_pitch_x = pitch_radius * cos_pitch_result;
+  int diff_pitch_y = pitch_radius * sin_pitch_result;
+
+  int roll_width = 35;
+  int roll_start_x = 5;
+  int roll_start_y = pitch_start_y + 10;
+  int roll_arrow_height = 20;
+  int roll_arrow_gap = 10;
+  float roll_multi = 1.2;
+
+  int diff_roll_y = abs(roll_width * tan_roll_result) * roll_multi;
+
+  displayBig.setTextSize(1);
+
+  // draw pitch
+  displayBig.drawCircle(pitch_start_x, pitch_start_y, 5, SSD1306_WHITE);
+  displayBig.drawLine(pitch_start_x, pitch_start_y, pitch_start_x + diff_pitch_x, pitch_start_y + diff_pitch_y, SSD1306_WHITE);
+  displayBig.drawLine(pitch_start_x, pitch_start_y, pitch_start_x - diff_pitch_x, pitch_start_y - diff_pitch_y, SSD1306_WHITE);
+  displayBig.drawFastVLine(pitch_start_x + diff_pitch_x, pitch_start_y + diff_pitch_y, 10, WHITE);
+  displayBig.drawFastVLine(pitch_start_x - diff_pitch_x, pitch_start_y - diff_pitch_y, 10, WHITE);
+
+  // disp corners
+  // displayBig.drawFastHLine(0, 63, 10, WHITE);
+  // displayBig.drawFastHLine(117, 0, 10, WHITE);
+  // displayBig.drawFastVLine(0, 53, 10, WHITE);
+  // displayBig.drawFastVLine(127, 0, 10, WHITE);
+
+  displayBig.drawFastVLine(63, 20, 64, WHITE);
+  displayBig.drawFastVLine(64, 20, 64, WHITE);
+
+  // draw roll
+  displayBig.drawFastHLine(roll_start_x, roll_start_y, roll_width, WHITE);
+  if (curr_roll_angle > 0) {
+    displayBig.drawLine(roll_start_x, roll_start_y, roll_start_x + roll_width, roll_start_y - diff_roll_y, SSD1306_WHITE);
+  } else {
+    displayBig.drawLine(roll_start_x + roll_width, roll_start_y, roll_start_x, roll_start_y - diff_roll_y, SSD1306_WHITE);
+  }
+
+  // draw roll arrow
+  if (abs(curr_roll_angle) > 1) {
+    displayBig.drawFastVLine(roll_start_x + roll_width + roll_arrow_gap, roll_start_y - roll_arrow_height, roll_arrow_height, SSD1306_WHITE);
+    if (curr_roll_angle > 0) {
+      displayBig.fillTriangle(
+        roll_start_x + roll_width + roll_arrow_gap,
+        roll_start_y - roll_arrow_height,
+        roll_start_x + roll_width + roll_arrow_gap - 5,
+        roll_start_y - roll_arrow_height + 5,
+        roll_start_x + roll_width + roll_arrow_gap + 5,
+        roll_start_y - roll_arrow_height + 5,
+        WHITE);
+    } else {
+      displayBig.fillTriangle(
+        roll_start_x + roll_width + roll_arrow_gap,
+        roll_start_y, roll_start_x + roll_width + roll_arrow_gap - 5,
+        roll_start_y - 5,
+        roll_start_x + roll_width + roll_arrow_gap + 5,
+        roll_start_y - 5,
+        WHITE);
+    }
+  }
+
+
+  displayBig.setTextColor(SSD1306_WHITE);
+
+  displayBig.setTextSize(1.5);
+
+  displayBig.setCursor(0, 0);
+  displayBig.print(F(" R:"));
+  displayBig.print(curr_roll_angle);
+
+  displayBig.setCursor(64, 0);
+  displayBig.print(F("P:"));
+  displayBig.print(curr_pitch_angle);
+
+  displayBig.display();
+}
+
+void updateBigDisplayElevationChart() {
+  int bottomYPosition = 78;
+  int maxHeight = 15;
+  int xDiff = 0;
+
+  float realMaxChartValue = max((float)6, max(abs(maxChartValue), abs(minChartValue)));
+  float realMaxChartValueMapHigh = realMaxChartValue * 1000;
+  float realMaxChartValueMapLow = -1 * realMaxChartValue * 1000;
+  float maxHeightMapHigh = maxHeight * 1000;
+  float maxHeightMapLow = -1 * maxHeight * 1000;
+  
+  int barIndex = 0;
+  int barValue = 0;
+
+  if (chartBarCycle) {
+    for (int i = chartBarsPointer; i < chartWidth; i++) {
+      barValue = int(map(chartBars[i]*1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh)/1000 + 0.5);
+      
+      displayBig.drawLine(barIndex + xDiff, bottomYPosition, barIndex + xDiff, bottomYPosition - barValue, WHITE);
+      
+      barIndex++;
+      //Serial.print(F(","));
+    }
+  }
+
+  for (int i = 0; i < chartBarsPointer; i++) {
+    barValue = int(map(chartBars[i]*1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh)/1000 + 0.5);
+
+    displayBig.drawLine(barIndex + xDiff, bottomYPosition, barIndex + xDiff, bottomYPosition - barValue, WHITE);
+    
+    //Serial.print(F(","));
+    barIndex++;
+  }
+
+  //displayBig.drawLine(0, bottomYPosition - maxHeight, 63, bottomYPosition - maxHeight, WHITE);
+  displayBig.drawLine(0, bottomYPosition, 63, bottomYPosition, WHITE);
+}
+
+void updateBigDisplayGyroData() {
+  //Serial.print("P(R)="); Serial.print(curr_pitch_rad); Serial.print(" R(R)="); Serial.print(curr_roll_rad);
+  //Serial.print(" P(A)="); Serial.print(curr_pitch_angle); Serial.print(" R(A)="); Serial.println(curr_roll_angle);
+
+  int roll_arrow_x = 56;
+  int roll_arrow_y = 58;
+  int roll_arrow_height = 28;
+
+  displayBig.setTextColor(SSD1306_WHITE);
+
+  // draw horizontal line
+  displayBig.drawFastHLine(0, 25, 64, WHITE);
+
+  displayBig.setCursor(0, 39);
+  displayBig.setTextSize(2);
+
+  int curr_roll_angle_int = int(curr_roll_angle_smooth + 0.5);
+
+  // draw number sign and black box
+  if (curr_roll_angle_int > 0) {
+    displayBig.fillRect(2, 39, 6, 14, SSD1306_BLACK);
+    displayBig.fillRect(0, 42, 12, 8, SSD1306_BLACK);
+    displayBig.print(F("+"));
+  } else if (curr_roll_angle_int < 0) {
+    displayBig.fillRect(0, 42, 12, 8, SSD1306_BLACK);
+    displayBig.print(F("-"));
+  }
+
+  // draw black box behind numbers
+  if(abs(curr_roll_angle_int) >= 10) {
+    displayBig.fillRoundRect(10, 30, 37, 31, 3, SSD1306_BLACK);
+  } else {
+    displayBig.fillRoundRect(10, 30, 20, 31, 3, SSD1306_BLACK);
+  }
+
+  displayBig.setTextSize(3);
+  displayBig.setCursor(13, 35);
+  displayBig.print(abs(curr_roll_angle_int));
+
+  // draw roll arrow
+  if (abs(curr_roll_angle_int) > 0) {
+    displayBig.fillRect(roll_arrow_x - 2, roll_arrow_y - roll_arrow_height  + 10, 5, roll_arrow_height - 8, SSD1306_BLACK);
+    displayBig.drawFastVLine(roll_arrow_x, roll_arrow_y - roll_arrow_height, roll_arrow_height, SSD1306_WHITE);
+    if (curr_roll_angle_int > 0) {
+      displayBig.fillTriangle(
+        roll_arrow_x,
+        roll_arrow_y - roll_arrow_height,
+        roll_arrow_x - 6,
+        roll_arrow_y - roll_arrow_height + 9,
+        roll_arrow_x + 6,
+        roll_arrow_y - roll_arrow_height + 9,
+        WHITE);
+    } else {
+      displayBig.fillTriangle(
+        roll_arrow_x,
+        roll_arrow_y + 2,
+        roll_arrow_x - 8,
+        roll_arrow_y - 11,
+        roll_arrow_x + 8,
+        roll_arrow_y - 11,
+        SSD1306_BLACK);
+      displayBig.fillTriangle(
+        roll_arrow_x,
+        roll_arrow_y,
+        roll_arrow_x - 6,
+        roll_arrow_y - 9,
+        roll_arrow_x + 6,
+        roll_arrow_y - 9,
+        WHITE);
+    }
+  }
+
+  // draw horizontal dash line
+  // displayBig.drawFastHLine(0, 78, 64, SSD1306_WHITE);
+  // bool middle = false;
+  // int leftFront = 0;
+  // int rightFront = 63;
+  // int dashSize = 3;
+  // int dashSpace = 3;
+  // while (!middle) {
+  //   rightFront -= dashSize;
+
+  //   displayBig.drawFastHLine(leftFront, 78, dashSize, WHITE);
+  //   displayBig.drawFastHLine(rightFront, 78, dashSize, WHITE);
+
+  //   leftFront += dashSize;
+
+  //   leftFront += dashSpace;
+  //   rightFront -= dashSpace;
+
+  //   if (leftFront >= 31) {
+  //     middle = true;
+  //   }
+  // }
+
+  // draw pitch
+  int arrowWidth = 40;
+
+  displayBig.setTextSize(3);
+  int curr_pitch_angle_int = max(min(int(curr_pitch_angle + 0.5), 99), -99);
+
+  String pitchSign;
+  if (curr_pitch_angle_int > 0) {
+    pitchSign = '+';
+  } else if (curr_pitch_angle_int < 0) {
+    pitchSign = '-';
+  } else {
+    pitchSign = String("");
+  }
+
+  String pitchValue = pitchSign + String(abs(curr_pitch_angle_int));
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  displayBig.getTextBounds(pitchValue, 0, 0, &x1, &y1, &w, &h);
+
+  if (curr_pitch_angle_int > 0) {
+    displayBig.setCursor(63 - w, 107);
+  } else if (curr_pitch_angle_int < 0) {
+    displayBig.setCursor(0, 107);
+  } else {
+    displayBig.setCursor(32 - w / 2, 100);
+  }
+
+  displayBig.print(pitchValue);
+
+  // draw pitch arrow
+  if (abs(curr_pitch_angle_int) > 0) {
+    int pitchArrowY = 110;
+    int topY = 98;
+    if (curr_pitch_angle > 0) {
+      displayBig.fillRect(pitchArrowY - topY - 3, topY - 3, 24, 7, SSD1306_BLACK);
+      
+      displayBig.drawLine(0, pitchArrowY, pitchArrowY - topY, topY, SSD1306_WHITE);
+      displayBig.drawFastHLine(pitchArrowY - topY, topY, 20, SSD1306_WHITE);
+      displayBig.fillTriangle(
+        0,
+        pitchArrowY,
+        2,
+        pitchArrowY - 10,
+        10,
+        pitchArrowY - 2,
+        WHITE);
+    } else {
+      displayBig.fillRect(63 - (pitchArrowY - topY) - 20 - 3, topY - 3, 24, 7, SSD1306_BLACK);
+
+      displayBig.drawLine(63, pitchArrowY, 63 - (pitchArrowY - topY), topY, SSD1306_WHITE);
+      displayBig.drawFastHLine(63 - (pitchArrowY - topY) - 20, topY, 20, SSD1306_WHITE);
+      displayBig.fillTriangle(
+        63,
+        pitchArrowY,
+        63 - 2,
+        pitchArrowY - 10,
+        63 - 10,
+        pitchArrowY - 2,
+        WHITE);
+    }
+  }
+  // draw display
+  // displayBig.display();
+}
+
+void updateBigDisplayMinMaxData() {
+  displayBig.setTextSize(1);
+
+  String xSign;
+  String ySign;
+
+  int aXValue = int(maxChartValue + 0.5);
+  int aYValue = int(minChartValue + 0.5);
+
+  if (aXValue > 0) {
+    xSign = '+';
+  } else if (aXValue < 0) {
+    xSign = '-';
+  } else {
+    xSign = String("");
+  }
+  if (aYValue > 0) {
+    ySign = '+';
+  } else if (aYValue < 0) {
+    ySign = '-';
+  } else {
+    ySign = String("");
+  }
+
+  String aX = xSign + String(abs(aXValue));
+  String aY = ySign + String(abs(aYValue));
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  displayBig.getTextBounds(aX, 0, 0, &x1, &y1, &w, &h);
+  displayBig.setCursor(63 - w, 68);
+  displayBig.print(aX);
+
+  displayBig.getTextBounds(aY, 0, 0, &x1, &y1, &w, &h);
+  displayBig.setCursor(63 - w, 82);
+  displayBig.print(aY);
+}
+
+void configDisplays() {
+  // displaySmall.setTextSize(1);
+  // displaySmall.setRotation(0);
+
+  displayBig.setRotation(3);
+  displayBig.setTextColor(SSD1306_WHITE);
+}
+
+
+void showStartDisplayMessage(String message) {
+  displayBig.clearDisplay();
+
+  displayBig.setTextSize(1);
+  displayBig.setTextColor(SSD1306_WHITE);
+
+  displayBig.setCursor(0, 10);
+  displayBig.print(message);
+
+  displayBig.display();
+}

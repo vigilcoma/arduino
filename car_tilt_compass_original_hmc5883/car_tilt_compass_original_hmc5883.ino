@@ -3,7 +3,7 @@
 #include "I2Cdev.h"
 
 #include "Wire.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050_6Axis_MotionApps612.h"
 #include <HMC5883L.h>
 #include <Adafruit_SSD1306.h>
 
@@ -31,13 +31,14 @@ ESP8266HTTPUpdateServer httpUpdater;
 ////VERSION
 ///////////
 
-String version = "Version:\n0.9\nchart";
+String version = "Version:\n1.33-m16.2\n5Hz";
 
 
 ///////////
-////INSTALLATION CORRECTION
+////INSTALLATION ROLL CORRECTION
 ///////////
-int rollCorrection = 17;
+int rollCorrection = -1;
+int pitchCorrection = 2;
 
 //////////////
 /// COMPASS VARS
@@ -51,7 +52,7 @@ int maxY = 0;
 int offX = 0;
 int offY = 0;
 
-const char compass_queue_new[][10] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"};
+const char compass_queue_new[][10] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW", "N" };
 
 unsigned long last_compass_time;
 int compass_update_interval = 100;
@@ -62,41 +63,6 @@ bool compassCalibration = false;
 bool compassCalibrationDone = false;
 
 //// ::END OF COMPASS VARS
-
-// uncomment "OUTPUT_READABLE_QUATERNION" if you want to see the actual
-// quaternion components in a [w, x, y, z] format (not best for parsing
-// on a remote host such as Processing or something though)
-//#define OUTPUT_READABLE_QUATERNION
-
-// uncomment "OUTPUT_READABLE_EULER" if you want to see Euler angles
-// (in degrees) calculated from the quaternions coming from the FIFO.
-// Note that Euler angles suffer from gimbal lock (for more info, see
-// http://en.wikipedia.org/wiki/Gimbal_lock)
-//#define OUTPUT_READABLE_EULER
-
-// uncomment "OUTPUT_READABLE_YAWPITCHROLL" if you want to see the yaw/
-// pitch/roll angles (in degrees) calculated from the quaternions coming
-// from the FIFO. Note this also requires gravity vector calculations.
-// Also note that yaw/pitch/roll angles suffer from gimbal lock (for
-// more info, see: http://en.wikipedia.org/wiki/Gimbal_lock)
-#define OUTPUT_READABLE_YAWPITCHROLL
-
-// uncomment "OUTPUT_READABLE_REALACCEL" if you want to see acceleration
-// components with gravity removed. This acceleration reference frame is
-// not compensated for orientation, so +X is always +X according to the
-// sensor, just without the effects of gravity. If you want acceleration
-// compensated for orientation, us OUTPUT_READABLE_WORLDACCEL instead.
-#define OUTPUT_READABLE_REALACCEL
-
-// uncomment "OUTPUT_READABLE_WORLDACCEL" if you want to see acceleration
-// components with gravity removed and adjusted for the world frame of
-// reference (yaw is relative to initial orientation, since no magnetometer
-// is present in this case). Could be quite handy in some cases.
-#define OUTPUT_READABLE_WORLDACCEL
-
-// uncomment "OUTPUT_TEAPOT" if you want output that matches the
-// format used for the InvenSense teapot demo
-//#define OUTPUT_TEAPOT
 
 #define LED_PIN LED_BUILTIN  //13
 #define INTERRUPT_PIN D4     //D8  // use pin 2 on Arduino Uno & most boards
@@ -123,16 +89,13 @@ float ypr[3];         // [yaw, pitch, roll]   yaw/pitch/roll container and gravi
 int init_error_code = -1;
 
 unsigned long last_disp_time;
+unsigned long last_sensors_time;
 int disp_update_interval = 500;
+int sensors_update_interval = 100;
 
 
 // Use the following global variables and access functions to help store the overall
 // rotation angle of the sensor
-int acc_counter = 0;
-float acc_yaw_rad = 0;
-float acc_pitch_rad = 0;
-float acc_roll_rad = 0;
-
 float curr_yaw_rad = 0;
 float curr_pitch_rad = 0;
 float curr_roll_rad = 0;
@@ -140,33 +103,73 @@ float curr_roll_rad = 0;
 float curr_yaw_angle = 0;
 float curr_pitch_angle = 0;
 float curr_roll_angle = 0;
+
 float curr_roll_angle_smooth = 0;
+float curr_pitch_angle_smooth = 0;
+
+float curr_accel_x_smooth = 0;
+float curr_accel_y_smooth = 0;
+
+float rollCompensationSmooth = 0;
+float rollCompensation = 0;
+bool isAccelDirectionChanged = false;
+unsigned long next_accel_bounce_time;
+
+int mpuReadsCounter = 0;
+
+float curr_accel_x = 0;
+float curr_accel_y = 0;
+float curr_accel_z = 0;
+
+float max_accel_x = 0;
+float min_accel_x = 0;
+
+float max_accel_y = 0;
+float min_accel_y = 0;
 
 // data in radians
-void set_last_read_angle_data(float x, float y, float z) {
-  acc_yaw_rad += x;
-  acc_pitch_rad += y;
-  acc_roll_rad += z;
+void set_last_read_angle_data(float y, float p, float r) {
+  //wait for bounce tiome to compensate acceleration
+  // if (millis() > next_accel_bounce_time) {
+    
+  // }
 
-  acc_counter += 1;
+  if (abs(curr_accel_x) > 400) {
+      float compensation = map(abs(curr_accel_x), 400, 2000, 3, 15);
+
+      if (curr_accel_x < 0) {
+        compensation *= -1;
+      }
+
+      // if compensation sign has changed
+      // isAccelDirectionChanged = (rollCompensation / abs(rollCompensation) + compensation / abs(compensation)) == 0;
+      // if (isAccelDirectionChanged) {
+      //   next_accel_bounce_time = millis() + 200;
+      // }
+
+      rollCompensation = compensation;
+    } else {
+      rollCompensation = 0.0;
+    }
+
+  rollCompensationSmooth = 0.9*rollCompensationSmooth + 0.1*rollCompensation;
+
+
+  //r += rollCompensationSmooth * M_PI / 180;
+
+  curr_yaw_rad = 0.6 * curr_yaw_rad + 0.4 * y;
+  curr_pitch_rad = 0.6 * curr_pitch_rad + 0.4 * p;  //p;
+  curr_roll_rad = 0.6 * curr_roll_rad + 0.4 * r;    //r;
 }
 
 void calc_angle_data() {
-  curr_yaw_rad = acc_yaw_rad / acc_counter;
-  curr_pitch_rad = acc_pitch_rad / acc_counter;
-  curr_roll_rad = acc_roll_rad / acc_counter;
-
   curr_yaw_angle = curr_yaw_rad * 180 / M_PI;
   curr_pitch_angle = curr_pitch_rad * 180 / M_PI;
   curr_roll_angle = curr_roll_rad * 180 / M_PI;
 
-  acc_yaw_rad = curr_yaw_rad;
-  acc_pitch_rad = curr_pitch_rad;
-  acc_roll_rad = curr_roll_rad;
+  curr_roll_angle_smooth = curr_roll_angle + rollCorrection;     //0.8 * curr_roll_angle_smooth + 0.2 * (curr_roll_angle + rollCorrection);
+  curr_pitch_angle_smooth = curr_pitch_angle + pitchCorrection;  //0.8 * curr_pitch_angle_smooth + 0.2 * (curr_pitch_angle + pitchCorrection);
 
-  curr_roll_angle_smooth = 0.8 * curr_roll_angle_smooth + 0.2 * (curr_roll_angle + rollCorrection);
-
-  acc_counter = 1;
   // Serial.print("curr_yaw_rad=");Serial.print(curr_yaw_rad);
   // Serial.print(" curr_pitch_rad=");Serial.print(curr_pitch_rad);
   // Serial.print(" curr_roll_rad=");Serial.println(curr_roll_rad);
@@ -175,18 +178,35 @@ void calc_angle_data() {
   // Serial.print(" curr_roll_angle=");Serial.println(curr_roll_angle);
 }
 
+void set_last_accel_data(float x, float y, float z) {
+  curr_accel_x = x;
+  curr_accel_y = y;
+  curr_accel_z = z;
+
+  curr_accel_x_smooth = 0.9 * curr_accel_x_smooth + 0.1 * curr_accel_x;
+  curr_accel_y_smooth = 0.9 * curr_accel_y_smooth + 0.1 * curr_accel_y;
+}
+
+void calc_accel_data() {
+  max_accel_x = max(max_accel_x, curr_accel_x_smooth);
+  min_accel_x = min(min_accel_x, curr_accel_x_smooth);
+
+  max_accel_y = max(max_accel_y, curr_accel_y_smooth);
+  min_accel_y = min(min_accel_y, curr_accel_y_smooth);
+}
+
 //////////////
 /// ELEVATION CHART VARS
 /////////////////////////
 
-const int chartWidth = 60;
-const int chartTotalTime = 5;  // minutes
-const int oneChartBarTimeInterval = (chartTotalTime * 60 / chartWidth) * 1000 / 2;
+const int chartWidth = 45;
+const int chartTotalTime = 30;  // minutes
+const int oneChartBarTimeInterval = (chartTotalTime * 60 / chartWidth) * 1000;
 float chartBars[chartWidth];
 int chartBarsPointer = 0;
-float maxChartValue = 0.00;
+float maxChartValue = 0;
 int maxChartValueIndex = 0;
-float minChartValue = 1000.00;
+float minChartValue = 0;
 int minChartValueIndex = 0;
 boolean chartBarCycle = false;
 float curr_roll_angle_smooth_accum = 0.00;
@@ -202,25 +222,25 @@ void calc_elevation_chart_data() {
   if (millis() - last_chart_calc_time >= oneChartBarTimeInterval) {
     last_chart_calc_time = millis();
 
-    float value = (curr_roll_angle_smooth_accum / curr_roll_angle_smooth_counter); //(M_PI / 180) * 
+    float value = (curr_roll_angle_smooth_accum / curr_roll_angle_smooth_counter);  //(M_PI / 180) *
     bool update = false;
 
     //Serial.print(" value=");Serial.println(value);
 
     chartBars[chartBarsPointer] = value;
 
-    if(chartBarCycle) {
-      if(chartBarsPointer == maxChartValueIndex || chartBarsPointer == minChartValueIndex) {
+    if (chartBarCycle) {
+      if (chartBarsPointer == maxChartValueIndex || chartBarsPointer == minChartValueIndex) {
         maxChartValue = chartBars[0];
         minChartValue = chartBars[0];
 
         for (int i = 0; i < chartWidth; i++) {
-          if(chartBars[i] > maxChartValue) {
+          if (chartBars[i] > maxChartValue) {
             maxChartValue = chartBars[i];
             maxChartValueIndex = chartBarsPointer;
           }
 
-          if(chartBars[i] < minChartValue) {
+          if (chartBars[i] < minChartValue) {
             minChartValue = chartBars[i];
             minChartValueIndex = chartBarsPointer;
           }
@@ -229,29 +249,31 @@ void calc_elevation_chart_data() {
         update = true;
       }
     }
-    
-    if(value > maxChartValue) {
+
+    if (value > maxChartValue) {
       maxChartValue = value;
       maxChartValueIndex = chartBarsPointer;
 
       update = true;
     }
 
-    if(value < minChartValue) {
+    if (value < minChartValue) {
       minChartValue = value;
       minChartValueIndex = chartBarsPointer;
-      
+
       update = true;
     }
 
-    if(update) {
-      Serial.print(" minChartValue=");Serial.print(minChartValue);
-      Serial.print(" maxChartValue=");Serial.println(maxChartValue);
+    if (update) {
+      Serial.print(" minChartValue=");
+      Serial.print(minChartValue);
+      Serial.print(" maxChartValue=");
+      Serial.println(maxChartValue);
     }
 
     //Serial.print(" chartBarsPointer=");Serial.println(chartBarsPointer);
     //Serial.print(" bar=");Serial.println(chartBars[chartBarsPointer]);
-    
+
 
     if (chartBarsPointer >= chartWidth - 1) {
       chartBarCycle = true;
@@ -285,16 +307,11 @@ void set_last_read_compas_data(float h) {
   // acc_head_prev = h;
 
 
-  acc_head = h;
-  acc_compas_counter = 1;
+  acc_head = 0.5 * acc_head + 0.5 * h;
 }
 
 void calc_compass_average_data() {
-  curr_head = int((acc_head / acc_compas_counter) + 0.5);
-
-  acc_head = curr_head;
-
-  acc_compas_counter = 1;
+  curr_head = int(acc_head + 0.5);
 }
 
 void wificonfig_wifiOn() {
@@ -305,7 +322,7 @@ void wificonfig_wifiOn() {
 
 #define FPM_SLEEP_MAX_TIME 0xFFFFFFF
 bool otaServer = true;
-int otaServerExpireTime = 1000 * 60 * 5; //5 mins
+int otaServerExpireTime = 1000 * 60 * 5;  //5 mins
 
 
 void wificonfig_wifiOff() {
@@ -329,13 +346,13 @@ ICACHE_RAM_ATTR void dmpDataReady() {
 // ===               SETUP ROUTINE                              ===
 // ================================================================
 void setup() {
-  // join I2C bus (I2Cdev library doesn't do this automatically)
-  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    Wire.begin();
-    Wire.setClock(400000);  // 400kHz I2C clock. Comment this line if having compilation difficulties
-  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-    Fastwire::setup(400, true);
-  #endif
+// join I2C bus (I2Cdev library doesn't do this automatically)
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire.begin();
+  Wire.setClock(400000);  // 400kHz I2C clock. Comment this line if having compilation difficulties
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);
+#endif
 
   wificonfig_wifiOff();
 
@@ -354,6 +371,7 @@ void setup() {
   // initialize device
   Serial.println(F("Initializing I2C devices..."));
   mpu.initialize();
+  mpu.setDLPFMode(MPU6050_DLPF_BW_5);
   pinMode(INTERRUPT_PIN, INPUT);
 
   // verify connection
@@ -456,12 +474,12 @@ void setup() {
   compassReady = true;
 
   // configure LED for output
-  pinMode(LED_PIN, OUTPUT);
+  //pinMode(LED_PIN, OUTPUT);
 
   delay(200);
 
   //////// create wifi AP for OTA
-  if(otaServer) {
+  if (otaServer) {
     showStartDisplayMessage("Setup AP for OTA updates...");
 
     wificonfig_wifiOn();
@@ -472,23 +490,26 @@ void setup() {
     Serial.println(result == true ? "AP setup OK" : "AP setup failed");
 
     delay(200);
-    IPAddress myIP = WiFi.softAPIP();  
-    Serial.print("Access Point IP address: ");Serial.println(myIP);
+    IPAddress myIP = WiFi.softAPIP();
+    Serial.print("Access Point IP address: ");
+    Serial.println(myIP);
     if (mdns.begin("espotaserver", myIP)) {
       Serial.println("MDNS responder started");
     }
     httpUpdater.setup(&httpServer);
     httpServer.begin();
-    
+
     delay(100);
-    
+
     showStartDisplayMessage("HTTPUpdateServer ready! Open " + myIP.toString() + "/update in your browser");
     Serial.println("HTTPUpdateServer ready! Open http://espotaserver.local/update");
-    Serial.printf("or http://");Serial.print(myIP);Serial.println("/update in your browser");
+    Serial.printf("or http://");
+    Serial.print(myIP);
+    Serial.println("/update in your browser");
 
     delay(500);
   }
-  
+
   delay(500);
 
   last_disp_time = millis();
@@ -500,100 +521,43 @@ void setup() {
 
 void loop() {
   // read a packet from FIFO
-  if (dmpReady && mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {  // Get the Latest packet
+  if (dmpReady && (millis() - last_sensors_time >= sensors_update_interval) && mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {  // Get the Latest packet
+    last_sensors_time = millis();
+    mpuReadsCounter++;
+
+    // check for acceleration
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetAccel(&aa, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+    mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
+
+    set_last_accel_data(aaWorld.x, aaWorld.y, aaWorld.z);
+
+    ////////////////////////////////////////////////////////////
+
+    // check for tilt
     mpu.dmpGetQuaternion(&q, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-    
+
     set_last_read_angle_data(ypr[0], ypr[1], ypr[2]);
-
-// #ifdef OUTPUT_READABLE_QUATERNION
-//     // display quaternion values in easy matrix form: w x y z
-//     mpu.dmpGetQuaternion(&q, fifoBuffer);
-//     // Serial.print("quat\t");
-//     // Serial.print(q.w);
-//     // Serial.print("\t");
-//     // Serial.print(q.x);
-//     // Serial.print("\t");
-//     // Serial.print(q.y);
-//     // Serial.print("\t");
-//     // Serial.println(q.z);
-// #endif
-
-// #ifdef OUTPUT_READABLE_EULER
-//     // display Euler angles in degrees
-//     mpu.dmpGetQuaternion(&q, fifoBuffer);
-//     mpu.dmpGetEuler(euler, &q);
-//     // Serial.print("euler\t");
-//     // Serial.print(euler[0] * 180 / M_PI);
-//     // Serial.print("\t");
-//     // Serial.print(euler[1] * 180 / M_PI);
-//     // Serial.print("\t");
-//     // Serial.println(euler[2] * 180 / M_PI);
-// #endif
-
-// #ifdef OUTPUT_READABLE_YAWPITCHROLL
-//     // display Euler angles in degrees
-//     mpu.dmpGetQuaternion(&q, fifoBuffer);
-//     mpu.dmpGetGravity(&gravity, &q);
-//     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-
-//     // set_last_read_angle_data(ypr[0] * 180 / M_PI, ypr[1] * 180 / M_PI, ypr[2] * 180 / M_PI);
-//     set_last_read_angle_data(ypr[0], ypr[1], ypr[2]);
-
-//     // Serial.print("ypr\t");
-//     // Serial.print(ypr[0] * 180 / M_PI);
-//     // Serial.print("\t");
-//     // Serial.print(ypr[1] * 180 / M_PI);
-//     // Serial.print("\t");
-//     // Serial.println(ypr[2] * 180 / M_PI);
-// #endif
-
-// #ifdef OUTPUT_READABLE_REALACCEL
-//     // display real acceleration, adjusted to remove gravity
-//     mpu.dmpGetQuaternion(&q, fifoBuffer);
-//     mpu.dmpGetAccel(&aa, fifoBuffer);
-//     mpu.dmpGetGravity(&gravity, &q);
-//     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
-//     // Serial.print("areal\t");
-//     // Serial.print(aaReal.x);
-//     // Serial.print("\t");
-//     // Serial.print(aaReal.y);
-//     // Serial.print("\t");
-//     // Serial.println(aaReal.z);
-// #endif
-
-// #ifdef OUTPUT_READABLE_WORLDACCEL
-//     // display initial world-frame acceleration, adjusted to remove gravity
-//     // and rotated based on known orientation from quaternion
-//     mpu.dmpGetQuaternion(&q, fifoBuffer);
-//     mpu.dmpGetAccel(&aa, fifoBuffer);
-//     mpu.dmpGetGravity(&gravity, &q);
-//     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
-//     mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
-//     // Serial.print("aworld\t");
-//     // Serial.print(aaWorld.x);
-//     // Serial.print("\t");
-//     // Serial.print(aaWorld.y);
-//     // Serial.print("\t");
-//     // Serial.println(aaWorld.z);
-// #endif
   }
 
   ///////////////////
   // COMPASS
   ///////////////////
   if (compassCalibration) {
-    if(!compassCalibrationDone) {
+    if (!compassCalibrationDone) {
       doCompassCalibration();
     }
   } else {
     processCompass();
   }
 
-  if(otaServer) {
+  if (otaServer) {
     httpServer.handleClient();
-    if(millis() > otaServerExpireTime) {
+    if (millis() > otaServerExpireTime) {
       otaServer = false;
       wificonfig_wifiOff();
       Serial.println("Wifi off");
@@ -603,15 +567,19 @@ void loop() {
   if (millis() - last_disp_time >= disp_update_interval) {
     last_disp_time = millis();
 
+    calc_accel_data();
     calc_angle_data();
     calc_compass_average_data();
+
     calc_elevation_chart_data();
 
     // blink LED to indicate activity
-    blinkState = !blinkState;
-    digitalWrite(LED_PIN, blinkState);
+    //blinkState = !blinkState;
+    //digitalWrite(LED_PIN, blinkState);
 
     updateDisplayData();
+
+    mpuReadsCounter = 0;
   }
 }
 
@@ -624,7 +592,7 @@ void doCompassCalibration() {
   minY = min(minY, int(mag.YAxis));
   maxY = max(maxY, int(mag.YAxis));
 
-  if(millis() > compass_calibration_time) {
+  if (millis() > compass_calibration_time) {
     // Calculate offsets
     offX = (maxX + minX) / 2;
     offY = (maxY + minY) / 2;
@@ -673,7 +641,7 @@ void processCompass() {
     float headingDegrees = heading * 180 / M_PI;
     headingDegrees += 90;
 
-    if(headingDegrees >= 360) {
+    if (headingDegrees >= 360) {
       headingDegrees -= 360;
     }
 
@@ -696,6 +664,11 @@ void updateDisplayData() {
   updateBigDisplayCompassData();
   updateBigDisplayElevationChart();
   updateBigDisplayGyroData();
+  updateBigDisplayMinMaxData();
+  updateBigDisplayAccelerationData();
+  
+  //updateBigDisplayReadsCounter();
+  //updateBigDisplayMinMaxAccelerationData();
 
   displayBig.display();
 
@@ -765,17 +738,17 @@ void updateSmallDisplayData() {
 }
 
 void updateBigDisplayCompassData() {
-  if(compassCalibration) {
+  if (compassCalibration) {
     displayBig.setCursor(0, 1);
     displayBig.setTextSize(1);
 
-    if(compassCalibrationDone) {
+    if (compassCalibrationDone) {
       displayBig.print(offX);
       displayBig.print(" :: ");
       displayBig.print(offY);
     } else {
       displayBig.print("Calibration:");
-      displayBig.print(int((compass_calibration_time - millis())/1000));
+      displayBig.print(int((compass_calibration_time - millis()) / 1000));
     }
   } else {
     int shiftedHead = curr_head;
@@ -788,7 +761,7 @@ void updateBigDisplayCompassData() {
 
     int nearestSideIndex = int((float(shiftedHead) / 45.0) + 0.5);
     int normalizedIndex = nearestSideIndex % 8;
-    
+
 
     displayBig.setCursor(0, 1);
     displayBig.setTextSize(2);
@@ -806,7 +779,6 @@ void updateBigDisplayCompassData() {
     displayBig.print(curr_head);
   }
 }
-
 
 void updateBigDisplayData() {
   //Serial.print("P(R)="); Serial.print(curr_pitch_rad); Serial.print(" R(R)="); Serial.print(curr_roll_rad);
@@ -915,33 +887,33 @@ void updateBigDisplayData() {
 void updateBigDisplayElevationChart() {
   int bottomYPosition = 78;
   int maxHeight = 15;
-  int xDiff = (64 - chartWidth) / 2;
+  int xDiff = 0;
 
-  float realMaxChartValue = max((float)10, max(abs(maxChartValue), abs(minChartValue)));
+  float realMaxChartValue = max((float)6, max(abs(maxChartValue), abs(minChartValue)));
   float realMaxChartValueMapHigh = realMaxChartValue * 1000;
   float realMaxChartValueMapLow = -1 * realMaxChartValue * 1000;
   float maxHeightMapHigh = maxHeight * 1000;
   float maxHeightMapLow = -1 * maxHeight * 1000;
-  
+
   int barIndex = 0;
   int barValue = 0;
 
   if (chartBarCycle) {
     for (int i = chartBarsPointer; i < chartWidth; i++) {
-      barValue = int(map(chartBars[i]*1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh)/1000 + 0.5);
-      
+      barValue = int(map(chartBars[i] * 1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh) / 1000 + 0.5);
+
       displayBig.drawLine(barIndex + xDiff, bottomYPosition, barIndex + xDiff, bottomYPosition - barValue, WHITE);
-      
+
       barIndex++;
       //Serial.print(F(","));
     }
   }
 
   for (int i = 0; i < chartBarsPointer; i++) {
-    barValue = int(map(chartBars[i]*1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh)/1000 + 0.5);
+    barValue = int(map(chartBars[i] * 1000, realMaxChartValueMapLow, realMaxChartValueMapHigh, maxHeightMapLow, maxHeightMapHigh) / 1000 + 0.5);
 
     displayBig.drawLine(barIndex + xDiff, bottomYPosition, barIndex + xDiff, bottomYPosition - barValue, WHITE);
-    
+
     //Serial.print(F(","));
     barIndex++;
   }
@@ -958,10 +930,13 @@ void updateBigDisplayGyroData() {
   int roll_arrow_y = 58;
   int roll_arrow_height = 28;
 
+  int16_t x1, y1;
+  uint16_t w, h;
+
   displayBig.setTextColor(SSD1306_WHITE);
 
   // draw horizontal line
-  displayBig.drawFastHLine(0, 25, 64, WHITE);
+  //displayBig.drawFastHLine(0, 25, 64, WHITE);
 
   displayBig.setCursor(0, 39);
   displayBig.setTextSize(2);
@@ -979,7 +954,7 @@ void updateBigDisplayGyroData() {
   }
 
   // draw black box behind numbers
-  if(abs(curr_roll_angle_int) >= 10) {
+  if (abs(curr_roll_angle_int) >= 10) {
     displayBig.fillRoundRect(10, 30, 37, 31, 3, SSD1306_BLACK);
   } else {
     displayBig.fillRoundRect(10, 30, 20, 31, 3, SSD1306_BLACK);
@@ -991,7 +966,7 @@ void updateBigDisplayGyroData() {
 
   // draw roll arrow
   if (abs(curr_roll_angle_int) > 0) {
-    displayBig.fillRect(roll_arrow_x - 2, roll_arrow_y - roll_arrow_height  + 10, 5, roll_arrow_height - 8, SSD1306_BLACK);
+    displayBig.fillRect(roll_arrow_x - 2, roll_arrow_y - roll_arrow_height + 10, 5, roll_arrow_height - 8, SSD1306_BLACK);
     displayBig.drawFastVLine(roll_arrow_x, roll_arrow_y - roll_arrow_height, roll_arrow_height, SSD1306_WHITE);
     if (curr_roll_angle_int > 0) {
       displayBig.fillTriangle(
@@ -1049,7 +1024,8 @@ void updateBigDisplayGyroData() {
   int arrowWidth = 40;
 
   displayBig.setTextSize(3);
-  int curr_pitch_angle_int = max(min(int(curr_pitch_angle + 0.5), 99), -99);
+
+  int curr_pitch_angle_int = -1 * int(curr_pitch_angle_smooth + 0.5);
 
   String pitchSign;
   if (curr_pitch_angle_int > 0) {
@@ -1062,13 +1038,11 @@ void updateBigDisplayGyroData() {
 
   String pitchValue = pitchSign + String(abs(curr_pitch_angle_int));
 
-  int16_t x1, y1;
-  uint16_t w, h;
   displayBig.getTextBounds(pitchValue, 0, 0, &x1, &y1, &w, &h);
 
-  if (curr_pitch_angle_int > 0) {
+  if (curr_pitch_angle_int < 0) {
     displayBig.setCursor(63 - w, 107);
-  } else if (curr_pitch_angle_int < 0) {
+  } else if (curr_pitch_angle_int > 0) {
     displayBig.setCursor(0, 107);
   } else {
     displayBig.setCursor(32 - w / 2, 100);
@@ -1080,9 +1054,9 @@ void updateBigDisplayGyroData() {
   if (abs(curr_pitch_angle_int) > 0) {
     int pitchArrowY = 110;
     int topY = 98;
-    if (curr_pitch_angle > 0) {
+    if (curr_pitch_angle_int < 0) {
       displayBig.fillRect(pitchArrowY - topY - 3, topY - 3, 24, 7, SSD1306_BLACK);
-      
+
       displayBig.drawLine(0, pitchArrowY, pitchArrowY - topY, topY, SSD1306_WHITE);
       displayBig.drawFastHLine(pitchArrowY - topY, topY, 20, SSD1306_WHITE);
       displayBig.fillTriangle(
@@ -1108,12 +1082,100 @@ void updateBigDisplayGyroData() {
         WHITE);
     }
   }
-
-
-
-
   // draw display
-  displayBig.display();
+  // displayBig.display();
+}
+
+void updateBigDisplayAccelerationData() {
+  /////// show accel value
+  String curAcceleration = String(curr_accel_x/1000, 1);
+  curAcceleration = curAcceleration + "/" + int(rollCompensationSmooth + 0.5);
+
+  int centerY = 26;
+  int hGap = 3;
+
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  displayBig.setTextSize(1);
+  displayBig.getTextBounds(curAcceleration, 0, 0, &x1, &y1, &w, &h);
+
+  //draw black back
+  //displayBig.fillRect(31 - w/2 - hGap, centerY - 2, w + 2*hGap, h, SSD1306_BLACK);
+
+  //draw to vertical lines
+  //displayBig.drawFastVLine(31 - w/2 - hGap, centerY - 2, 5, SSD1306_WHITE);
+  //displayBig.drawFastVLine(31 + w/2 + hGap, centerY - 2, 5, SSD1306_WHITE);
+
+  // draw accel value
+  displayBig.setCursor(31-w/2, centerY - h/2);
+  displayBig.print(curAcceleration);
+}
+
+void updateBigDisplayMinMaxData() {
+  displayBig.setTextSize(1);
+
+  String xSign;
+  String ySign;
+
+  int aXValue = int(maxChartValue + 0.5);
+  int aYValue = int(minChartValue + 0.5);
+
+  if (aXValue > 0) {
+    xSign = '+';
+  } else if (aXValue < 0) {
+    xSign = '-';
+  } else {
+    xSign = String("");
+  }
+  if (aYValue > 0) {
+    ySign = '+';
+  } else if (aYValue < 0) {
+    ySign = '-';
+  } else {
+    ySign = String("");
+  }
+
+  String aX = xSign + String(abs(aXValue));
+  String aY = ySign + String(abs(aYValue));
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  displayBig.getTextBounds(aX, 0, 0, &x1, &y1, &w, &h);
+  displayBig.setCursor(63 - w, 68);
+  displayBig.print(aX);
+
+  displayBig.getTextBounds(aY, 0, 0, &x1, &y1, &w, &h);
+  displayBig.setCursor(63 - w, 82);
+  displayBig.print(aY);
+}
+
+void updateBigDisplayMinMaxAccelerationData() {
+  displayBig.setTextSize(1);
+
+  displayBig.setCursor(0, 63);
+  displayBig.print(String((float)max_accel_x / 1000.0, 2));
+  displayBig.setCursor(0, 72);
+  displayBig.print(String((float)min_accel_x / 1000.0, 2));
+  displayBig.setCursor(0, 81);
+  displayBig.print(String((float)curr_accel_x_smooth / 1000.0, 2));
+
+  displayBig.setCursor(35, 63);
+  displayBig.print(String((float)max_accel_y / 1000.0, 2));
+  displayBig.setCursor(35, 72);
+  displayBig.print(String((float)min_accel_y / 1000.0, 2));
+  displayBig.setCursor(35, 81);
+  displayBig.print(String((float)curr_accel_y_smooth / 1000.0, 2));
+}
+
+void updateBigDisplayReadsCounter() {
+  displayBig.setTextSize(1);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  displayBig.getTextBounds(String(mpuReadsCounter), 0, 0, &x1, &y1, &w, &h);
+  displayBig.setCursor(63 - w, 127 - h);
+  displayBig.print(String(mpuReadsCounter));
 }
 
 void configDisplays() {
