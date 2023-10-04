@@ -1,8 +1,4 @@
-const int chartRollWidth = chartRollW;
-const int chartTotalTime = 30;  // minutes
 
-const int oneChartBarTimeInterval = (chartTotalTime * 60 / chartRollWidth) * 1000;
-unsigned long last_chart_calc_time;
 
 float chartBars[chartRollWidth];
 int chartBarsPointer = 0;
@@ -12,81 +8,79 @@ bool chartBarCycle = false;
 float curr_roll_angle_smooth_accum = 0.00;
 int curr_roll_angle_smooth_counter = 0;
 
-void calc_elevation_chart_data() {
+void process_roll_chart_data() {
   curr_roll_angle_smooth_accum += rollOutput;
   curr_roll_angle_smooth_counter++;
-
-  if (millis() - last_chart_calc_time >= oneChartBarTimeInterval) {
-    last_chart_calc_time = millis();
-
-    float value = (curr_roll_angle_smooth_accum / curr_roll_angle_smooth_counter);  //(M_PI / 180) *
-    bool update = false;
-
-    //Serial.print(" value=");Serial.println(value);
-
-    chartBars[chartBarsPointer] = value;
-
-    if (chartBarCycle) {
-      if (chartBarsPointer == maxChartValueIndex || chartBarsPointer == minChartValueIndex) {
-        maxChartValue = chartBars[0];
-        minChartValue = chartBars[0];
-
-        for (int i = 0; i < chartRollWidth; i++) {
-          if (chartBars[i] > maxChartValue) {
-            maxChartValue = chartBars[i];
-            maxChartValueIndex = chartBarsPointer;
-          }
-
-          if (chartBars[i] < minChartValue) {
-            minChartValue = chartBars[i];
-            minChartValueIndex = chartBarsPointer;
-          }
-        }
-
-        update = true;
-      }
-    }
-
-    if (value > maxChartValue) {
-      maxChartValue = value;
-      maxChartValueIndex = chartBarsPointer;
-
-      update = true;
-    }
-
-    if (value < minChartValue) {
-      minChartValue = value;
-      minChartValueIndex = chartBarsPointer;
-
-      update = true;
-    }
-
-    if (update && serialDebug) {
-      Serial.print(" minChartValue=");
-      Serial.print(minChartValue);
-      Serial.print(" maxChartValue=");
-      Serial.println(maxChartValue);
-    }
-
-    //Serial.print(" chartBarsPointer=");Serial.println(chartBarsPointer);
-    //Serial.print(" bar=");Serial.println(chartBars[chartBarsPointer]);
-
-
-    if (chartBarsPointer >= chartRollWidth - 1) {
-      chartBarCycle = true;
-      chartBarsPointer = 0;
-    } else {
-      chartBarsPointer++;
-    }
-
-    //Serial.print(" chartBarsPointerNext=");Serial.println(chartBarsPointer);
-
-    curr_roll_angle_smooth_accum = 0;
-    curr_roll_angle_smooth_counter = 0;
-  }
 }
 
-void updateBigDisplayElevationChart() {
+void calc_roll_chart_data() {
+  float value = (curr_roll_angle_smooth_accum / curr_roll_angle_smooth_counter);  //(M_PI / 180) *
+  bool update = false;
+
+  //Serial.print(" value=");Serial.println(value);
+
+  chartBars[chartBarsPointer] = value;
+
+  if (chartBarCycle) {
+    if (chartBarsPointer == maxChartValueIndex || chartBarsPointer == minChartValueIndex) {
+      maxChartValue = chartBars[0];
+      minChartValue = chartBars[0];
+
+      for (int i = 0; i < chartRollWidth; i++) {
+        if (chartBars[i] > maxChartValue) {
+          maxChartValue = chartBars[i];
+          maxChartValueIndex = chartBarsPointer;
+        }
+
+        if (chartBars[i] < minChartValue) {
+          minChartValue = chartBars[i];
+          minChartValueIndex = chartBarsPointer;
+        }
+      }
+
+      update = true;
+    }
+  }
+
+  if (value > maxChartValue) {
+    maxChartValue = value;
+    maxChartValueIndex = chartBarsPointer;
+
+    update = true;
+  }
+
+  if (value < minChartValue) {
+    minChartValue = value;
+    minChartValueIndex = chartBarsPointer;
+
+    update = true;
+  }
+
+  if (update && serialDebug) {
+    Serial.print(" minChartValue=");
+    Serial.print(minChartValue);
+    Serial.print(" maxChartValue=");
+    Serial.println(maxChartValue);
+  }
+
+  //Serial.print(" chartBarsPointer=");Serial.println(chartBarsPointer);
+  //Serial.print(" bar=");Serial.println(chartBars[chartBarsPointer]);
+
+
+  if (chartBarsPointer >= chartRollWidth - 1) {
+    chartBarCycle = true;
+    chartBarsPointer = 0;
+  } else {
+    chartBarsPointer++;
+  }
+
+  //Serial.print(" chartBarsPointerNext=");Serial.println(chartBarsPointer);
+
+  curr_roll_angle_smooth_accum = 0;
+  curr_roll_angle_smooth_counter = 0;
+}
+
+void updateBigDisplayRollChart() {
   int bottomYPosition = chartRollY + chartRollH/2;
   int maxHeight = chartRollH * 0.45;
   int xDiff = 0;
@@ -124,7 +118,7 @@ void updateBigDisplayElevationChart() {
   }
 }
 
-void updateBigDisplayMinMaxData() {
+void updateBigDisplayRollMinMaxData() {
   String xSign;
   String ySign;
 

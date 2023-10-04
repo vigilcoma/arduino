@@ -50,12 +50,15 @@ const int chartRollX = 1;
 const int chartRollY = 36;
 const int chartRollW = 80;
 const int chartRollH = 28;
+const int chartRollWidth = chartRollW;
 
 // --- Global vars
 bool otaServer = true;
 float rollOutput, pitchOutput;
 float pressureOutput = 0.0;
+float tempOutput = 0.0;
 float altitudeOutput = 0.0;
+const int chartTotalTime = 30;  // minutes
 
 // --- Init display messages
 int startMessageYPad = 0;
@@ -71,8 +74,10 @@ bool buttonActive = false;
 
 // -- Display state
 int currentDispPresentation = 0;
-int maxDispPresentation = 2;
+int maxDispPresentation = 4;
 int defaultDispPresentation = 1;
+const byte numChars = 20;
+const char dispNames[][numChars] = {"Roll chart", "Altitude", "Altitude chart", "Empty"};
 
 // ------- INTRO MODE VARS
 bool introMode = true;
@@ -95,6 +100,7 @@ bool CalibrationMode = false;
 bool bmpMeasureFlag = false;
 bool isBarometerReady = false;
 bool serialDebug = false;
+bool showDisplayName = true;
 
 // ----- Timings
 unsigned long last_disp_time;
@@ -104,6 +110,10 @@ int sensors_update_interval = 50;
 unsigned long last_compass_time;
 int compass_update_interval = 100;
 int compass_calibration_time = 30000;
+int display_name_interval = 3000;
+int display_name_time;
+unsigned long last_chart_calc_time;
+const int oneChartBarTimeInterval = (chartTotalTime * 60 / chartRollWidth) * 1000;
 
 void showStartDisplayMessage(String message, bool clear = true, UWORD Ystart = 0) {
   if(clear) {
@@ -247,6 +257,7 @@ void setup() {
 
   last_disp_time = millis();
   last_intro_time = millis();
+  display_name_time = millis();
 }
 
 // ================================================================
@@ -276,6 +287,12 @@ void loop() {
 
     applyMPUSettings();
   } else {
+    if (millis() - display_name_time >= display_name_interval) {  // Get the Latest packet
+      display_name_time = millis();
+
+      showDisplayName = false;
+    }
+
     processButton();
 
     calcAcceleration();
@@ -289,7 +306,15 @@ void loop() {
       
       calcHeading();
 
-      calc_elevation_chart_data();
+      process_roll_chart_data();
+      process_altitude_chart_data();
+
+      if (millis() - last_chart_calc_time >= oneChartBarTimeInterval) {
+        last_chart_calc_time = millis();
+
+        calc_roll_chart_data();
+        calc_altitude_chart_data();
+      }
 
       if(isBarometerReady) {
         calcAltitude();
@@ -352,6 +377,9 @@ void onSingleShortClick() {
   if(currentDispPresentation >= maxDispPresentation) {
     currentDispPresentation = 0;
   }
+
+  display_name_time = millis();
+  showDisplayName = true;
 }
 
 void onSingleLongClick() {
@@ -381,9 +409,16 @@ void updateDisplayData() {
     case 1:
       updateDisplayData1();
       break;
+    case 2:
+      updateDisplayData2();
+      break;
     default:
       // nothing
       break;
+  }
+
+  if(showDisplayName) {
+    updateBigDisplayName();
   }
 
   OLED_1IN51_Display(BlackImage);
@@ -391,10 +426,10 @@ void updateDisplayData() {
 
 void updateDisplayData0() {
   updateBigDisplayCompassData();
-  updateBigDisplayElevationChart();
+  updateBigDisplayRollChart();
   updateBigDisplayGyroPitchData();
   updateBigDisplayGyroRollData();
-  updateBigDisplayMinMaxData();
+  updateBigDisplayRollMinMaxData();
   updateBigDisplayAccelerationData();
   
   Paint_DrawLine(82,0,82,63,WHITE,DOT_PIXEL_1X1,LINE_STYLE_DOTTED);
@@ -447,6 +482,19 @@ void updateDisplayData1() {
       Serial.println();
     }
   }
+}
+
+void updateDisplayData2() {
+  updateBigDisplayCompassData();
+  updateBigDisplayAltitudeChart();
+  updateBigDisplayGyroPitchData();
+  updateBigDisplayGyroRollData();
+  updateBigDisplayAltMinMaxData();
+  updateBigDisplayAccelerationData();
+  
+  Paint_DrawLine(82,0,82,63,WHITE,DOT_PIXEL_1X1,LINE_STYLE_DOTTED);
+  Paint_DrawLine(0,36,127,36,WHITE,DOT_PIXEL_1X1,LINE_STYLE_DOTTED);
+  Paint_DrawLine(0,18,82,18,WHITE,DOT_PIXEL_1X1,LINE_STYLE_DOTTED);
 }
 
 // ↑↓
@@ -595,10 +643,31 @@ void updateBigDisplayBarometerData() {
   Paint_DrawLine(rMidX, rMidY, rEndX, rEndY, WHITE, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
 
   // draw altitude value
-  Paint_DrawString(9 + chartRollX + chartRollW/2, chartRollY + chartRollH/2, altitude, &Font16, 0.5, 0.5);
-
+  Paint_DrawString(9 + chartRollX + chartRollW/2, chartRollY + chartRollH/2 - 3, altitude, &Font16, 0.5, 0.5);
   // draw presseru value
-  Paint_DrawString(midMidX, midMidY - 2, String(pressureOutput, 0), &Font8, 0.5, 1);
+  Paint_DrawString(9 + chartRollX + chartRollW/2, chartRollY + chartRollH - 1, String(pressureOutput, 0), &Font8, 0.5, 1);
+  
+  // draw temp value
+  if(altitudeOutput > 999) {
+    Paint_DrawString(chartRollX + 1, midMidY - 2, String(tempOutput, 0) + "C", &Font8, 0, 1);
+  } else {
+    Paint_DrawString(midMidX, midMidY - 2, String(tempOutput, 0) + "C", &Font8, 0.5, 1);
+  }
+  
+}
+
+void updateBigDisplayName() {
+  String name = String(dispNames[currentDispPresentation]);
+  String page = String(currentDispPresentation + 1) + "/" + maxDispPresentation;
+
+  int width = 110, height = 40, border = 1;
+
+
+  Paint_DrawRectangle(64 - width/2 - border, 32 - height/2 - border, 64 + width/2 + border, 32 + height/2 + border, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+  Paint_DrawRectangle(64 - width/2, 32 - height/2, 64 + width/2, 32 + height/2, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+  
+  Paint_DrawString(64, 32 - 2, page, &Font12, 0.5, 1);
+  Paint_DrawString(64, 32 + 2, name, &Font12, 0.5, 0);
 }
 
 
@@ -652,6 +721,9 @@ void calcAltitude() {
 
       float pressure = bmx280.getPressure(); // in Si units for Pascal
       pressure /= 100.0F;
+
+      float temp = bmx280.getTemperature();
+
       
       float altitude = 44330 * (1.0 - pow(pressure / SEA_LEVEL_PRESSURE, 0.1903));
 
@@ -661,6 +733,10 @@ void calcAltitude() {
 
       if (!isnan(altitude)) {
         altitudeOutput = 0.9*altitudeOutput + 0.1*altitude;
+      }
+
+      if (!isnan(temp)) {
+        tempOutput = 0.9*tempOutput + 0.1*temp;
       }
     }
 }
